@@ -96,36 +96,47 @@ def _load_prog_from_mlmodel(model):
 
     return prog
 
+def _get_size_of_const_op(op):
+    size_in_mb = 0
+    if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
+        size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
+    if op.op_type.startswith("constexpr"):
+        for inp_var in op.inputs.values():
+            size_in_mb += _get_size_of_const_op(inp_var.op)
+    return size_in_mb
 
 def _get_op_idx_split_location(prog: Program):
-    """ Find the op that approximately bisects the graph as measure by weights size on each side
+    """ Find the op that approximately bisects the graph, equally, as measured by weights size on each side
     """
     main_block = prog.functions["main"]
     total_size_in_mb = 0
 
     for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            total_size_in_mb += size_in_mb
+        if not op.op_type.startswith("const"):
+            for inp_var in op.inputs.values():
+                if isinstance(inp_var, list):
+                    continue
+                if inp_var.op is not None:
+                    if inp_var.op.op_type.startswith("const"):
+                        total_size_in_mb += _get_size_of_const_op(inp_var.op)
+
     half_size = total_size_in_mb / 2
 
-    # Find the first non const op (single child), where the total cumulative size exceeds
+    # Find the first non const or non constexpr op, with single output var and child op, where the total cumulative size exceeds
     # the half size for the first time
     cumulative_size_in_mb = 0
-    for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            cumulative_size_in_mb += size_in_mb
+    for op_idx, op in enumerate(main_block.operations):
+        if not op.op_type.startswith("const"):
+            for inp_var in op.inputs.values():
+                if isinstance(inp_var, list):
+                    continue
+                if inp_var.op is not None:
+                    if inp_var.op.op_type.startswith("const"):
+                        cumulative_size_in_mb += _get_size_of_const_op(inp_var.op)
 
-        # Note: The condition "not op.op_type.startswith("const")" is to make sure that the
-        # incision op is neither of type "const" nor "constexpr_*" ops that
-        # are used to store compressed weights
-        if (cumulative_size_in_mb > half_size and not op.op_type.startswith("const")
-                and len(op.outputs) == 1
-                and len(op.outputs[0].child_ops) == 1):
-            op_idx = main_block.operations.index(op)
-            return op_idx, cumulative_size_in_mb, total_size_in_mb
-
+            if cumulative_size_in_mb > half_size:
+                if len(op.outputs) == 1 and len(op.outputs[0].child_ops) == 1:
+                    return op_idx, cumulative_size_in_mb, total_size_in_mb
 
 def _get_first_chunk_outputs(block, op_idx):
     # Get the list of all vars that go across from first program (all ops from 0 to op_idx (inclusive))
